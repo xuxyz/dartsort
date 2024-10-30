@@ -1,8 +1,9 @@
+import warnings
+
 import torch
 from dartsort.detect import detect_and_deduplicate
 from dartsort.util import spiketorch
 from dartsort.util.data_util import SpikeDataset
-import warnings
 
 from .peel_base import BasePeeler
 
@@ -76,66 +77,122 @@ class ThresholdAndFeaturize(BasePeeler):
         right_margin=0,
         return_residual=False,
     ):
-        times_rel, channels, energies = detect_and_deduplicate(
+        threshold_res = threshold_chunk(
             traces,
-            self.detection_threshold,
-            dedup_channel_index=self.spatial_dedup_channel_index,
-            peak_sign=self.peak_sign,
-            dedup_temporal_radius=self.dedup_temporal_radius_samples,
-            relative_peak_radius=self.relative_peak_radius_samples,
-            return_energies=True,
-        )
-        if not times_rel.numel():
-            return dict(n_spikes=0)
-
-        # want only peaks in the chunk
-        min_time = max(left_margin, self.spike_length_samples)
-        max_time = traces.shape[0] - max(
-            right_margin, self.spike_length_samples - self.trough_offset_samples
-        )
-        valid = (times_rel >= min_time) & (times_rel < max_time)
-        times_rel = times_rel[valid]
-        n_detect = times_rel.numel()
-        if not n_detect:
-            return dict(n_spikes=0)
-        channels = channels[valid]
-        voltages = traces[times_rel, channels]
-
-        if self.max_spikes_per_chunk is not None:
-            if n_detect > self.max_spikes_per_chunk:
-                warnings.warn(
-                    f"{n_detect} spikes in chunk was larger than "
-                    f"{self.max_spikes_per_chunk=}. Keeping the top ones."
-                )
-                energies = energies[valid]
-                best = torch.argsort(energies)[-self.max_spikes_per_chunk:]
-                best = best.sort().values
-                del energies
-
-                times_rel = times_rel[best]
-                channels = channels[best]
-                voltages = voltages[best]
-
-        # load up the waveforms for this chunk
-        waveforms = spiketorch.grab_spikes(
-            traces,
-            times_rel,
-            channels,
             self.channel_index,
-            trough_offset=self.trough_offset_samples,
+            detection_threshold=self.detection_threshold,
+            peak_sign="both",
+            spatial_dedup_channel_index=None,
+            trough_offset_samples=self.trough_offset_samples,
             spike_length_samples=self.spike_length_samples,
-            already_padded=False,
-            pad_value=torch.nan,
+            left_margin=left_margin,
+            right_margin=right_margin,
+            relative_peak_radius=5,
+            dedup_temporal_radius=7,
+            max_spikes_per_chunk=None,
+            quiet=False,
         )
 
         # get absolute times
-        times_samples = times_rel + chunk_start_samples - left_margin
+        times_samples = threshold_res['times_rel'] + chunk_start_samples
 
         peel_result = dict(
-            n_spikes=times_rel.numel(),
+            n_spikes=threshold_res['n_spikes'],
             times_samples=times_samples,
-            channels=channels,
-            voltages=voltages,
-            collisioncleaned_waveforms=waveforms,
+            channels=threshold_res['channels'],
+            voltages=threshold_res['voltages'],
+            collisioncleaned_waveforms=threshold_res['waveforms'],
         )
         return peel_result
+
+
+def threshold_chunk(
+    traces,
+    channel_index,
+    detection_threshold=4,
+    peak_sign="both",
+    spatial_dedup_channel_index=None,
+    trough_offset_samples=42,
+    spike_length_samples=121,
+    left_margin=0,
+    right_margin=0,
+    relative_peak_radius=5,
+    dedup_temporal_radius=7,
+    max_spikes_per_chunk=None,
+    quiet=False,
+):
+    n_index = channel_index.shape[1]
+    times_rel, channels, energies = detect_and_deduplicate(
+        traces,
+        detection_threshold,
+        dedup_channel_index=spatial_dedup_channel_index,
+        peak_sign=peak_sign,
+        dedup_temporal_radius=dedup_temporal_radius,
+        relative_peak_radius=relative_peak_radius,
+        return_energies=True,
+    )
+    if not times_rel.numel():
+        return dict(
+            n_spikes=0,
+            times_rel=times_rel,
+            channels=channels,
+            voltages=energies,
+            waveforms=energies.view(-1, spike_length_samples, n_index),
+        )
+
+    # want only peaks in the chunk
+    min_time = max(left_margin, spike_length_samples)
+    max_time = traces.shape[0] - max(
+        right_margin, spike_length_samples - trough_offset_samples
+    )
+    valid = (times_rel >= min_time) & (times_rel < max_time)
+    times_rel = times_rel[valid]
+    n_detect = times_rel.numel()
+    if not n_detect:
+        return dict(
+            n_spikes=0,
+            times_rel=times_rel,
+            channels=channels,
+            voltages=energies,
+            waveforms=energies.view(-1, spike_length_samples, n_index),
+        )
+    channels = channels[valid]
+    voltages = traces[times_rel, channels]
+
+    if max_spikes_per_chunk is not None:
+        if n_detect > max_spikes_per_chunk and not quiet:
+            warnings.warn(
+                f"{n_detect} spikes in chunk was larger than "
+                f"{max_spikes_per_chunk=}. Keeping the top ones."
+            )
+            energies = energies[valid]
+            best = torch.argsort(energies)[-max_spikes_per_chunk:]
+            best = best.sort().values
+            del energies
+
+            times_rel = times_rel[best]
+            channels = channels[best]
+            voltages = voltages[best]
+
+    # load up the waveforms for this chunk
+    waveforms = spiketorch.grab_spikes(
+        traces,
+        times_rel,
+        channels,
+        channel_index,
+        trough_offset=trough_offset_samples,
+        spike_length_samples=spike_length_samples,
+        already_padded=False,
+        pad_value=torch.nan,
+    )
+
+    # offset times for caller
+    times_rel -= left_margin
+
+    return dict(
+        n_spikes=times_rel.numel(),
+        times_rel=times_rel,
+        channels=channels,
+        voltages=voltages,
+        waveforms=waveforms,
+    )

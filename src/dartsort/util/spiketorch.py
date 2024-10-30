@@ -1,5 +1,6 @@
 import math
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from scipy.fftpack import next_fast_len
@@ -18,7 +19,7 @@ def fast_nanmedian(x, axis=-1):
 def ptp(waveforms, dim=1):
     is_tensor = torch.is_tensor(waveforms)
     if not is_tensor:
-        return waveforms.ptp(axis=dim)
+        return np.ptp(waveforms, axis=dim)
     return waveforms.max(dim=dim).values - waveforms.min(dim=dim).values
 
 
@@ -39,6 +40,9 @@ def ravel_multi_index(multi_index, dims):
         Indices into the flattened tensor of shape `dims`
     """
     if len(dims) == 1:
+        if isinstance(multi_index, tuple):
+            assert len(multi_index) == 1
+            multi_index = multi_index[0]
         assert multi_index.ndim == 1
         return multi_index
 
@@ -284,10 +288,10 @@ def convolve_lowrank(
 
 
 def nancov(x, correction=1):
-    xxt = x @ x.T
+    xtx = x.T @ x
     mask = x.isfinite().to(x)
-    nobs = mask @ mask.T
-    return xxt / (nobs + correction)
+    nobs = mask.T @ mask
+    return xtx / (nobs + correction)
 
 
 def real_resample(x, num, dim=0):

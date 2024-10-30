@@ -18,8 +18,8 @@ def scatter_max_channel_waveforms(
     colors=glasbey1024,
     **plot_kwargs,
 ):
-    dx = waveform_width * template_data.registered_geom[:, 0].ptp()
-    dz = template_data.registered_geom[:, 1].ptp()
+    dx = np.ptp(waveform_width * template_data.registered_geom[:, 0])
+    dz = np.ptp(template_data.registered_geom[:, 1])
     max_abs_amp = np.abs(template_data.templates).max()
     zscale = dz * waveform_height / max_abs_amp
 
@@ -32,7 +32,7 @@ def scatter_max_channel_waveforms(
         axis.scatter(*template_data.registered_geom.T, **geom_scatter_kwargs)
 
     for j, (u, temp) in enumerate(zip(template_data.unit_ids, template_data.templates)):
-        ptpvec = temp.ptp(0)
+        ptpvec = np.ptp(temp, 0)
         if ptpvec.max() == 0:
             continue
         mc = ptpvec.argmax()
@@ -53,6 +53,8 @@ def distance_matrix_dendro(
     show_unit_labels=False,
     vmax=1.0,
     image_cmap=plt.cm.RdGy,
+    show_values=False,
+    label=None,
 ):
     show_dendrogram = dendrogram_linkage is not None
     dendro_width = (
@@ -66,11 +68,9 @@ def distance_matrix_dendro(
 
     gs = panel.add_gridspec(
         nrows=3,
-        ncols=3 + 2 * show_dendrogram,
-        wspace=0.0,
-        hspace=0,
+        ncols=2 + show_dendrogram,
         height_ratios=[0.5, 1, 0.5],
-        width_ratios=[2, 0.15, *dendro_width, 0.1],
+        width_ratios=[2, 0.15, *dendro_width],
     )
     ax_im = panel.add_subplot(gs[:, 0])
     ax_cbar = panel.add_subplot(gs[1, -1])
@@ -96,24 +96,45 @@ def distance_matrix_dendro(
 
     im = ax_im.imshow(
         distances[order][:, order],
-        extent=[0, 100, 0, 100],
         vmin=0,
         vmax=vmax,
         cmap=image_cmap,
         origin="lower",
     )
+    if show_values:
+        for (j, i), val in np.ndenumerate(distances[order][:, order]):
+            lc = invert(image_cmap(val / vmax))
+            ax_im.text(i, j, f"{val:.2f}", ha="center", va="center", clip_on=True, color=lc)
     if show_unit_labels:
         if unit_ids is None:
             unit_ids = np.arange(distances.shape[0])
-        ax_im.set_xticks(10 * np.arange(len(order)) + 5, unit_ids[order])
-        ax_im.set_yticks(10 * np.arange(len(order)) + 5, unit_ids[order])
+        ax_im.set_xticks(np.arange(len(order)), unit_ids[order])
+        ax_im.set_yticks(np.arange(len(order)), unit_ids[order])
+        for i, (tx, ty) in enumerate(
+            zip(ax_im.xaxis.get_ticklabels(), ax_im.yaxis.get_ticklabels())
+        ):
+            tx.set_color(glasbey1024[unit_ids[i]])
+            ty.set_color(glasbey1024[unit_ids[i]])
     else:
         ax_im.set_xticks([])
         ax_im.set_yticks([])
 
-    plt.colorbar(im, cax=ax_cbar, label="template distance")
+    plt.colorbar(im, cax=ax_cbar, label=label)
     ax_cbar.set_yticks([0, vmax])
-    ax_cbar.set_ylabel("template distance", labelpad=-5)
+    if label:
+        ax_cbar.set_ylabel("template distance", labelpad=-5)
+    return ax_im
+
+
+_k = np.array([0., 0., 0., 1.])
+_w = np.array([1., 1., 1., 1.])
+
+
+def invert(color):
+    color = np.array(color)
+    if color[:3].mean() > 0.5:
+        return _k
+    return _w
 
 
 def get_linkage(dists, method="complete", threshold=0.25):

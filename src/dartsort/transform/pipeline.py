@@ -2,9 +2,6 @@
 """
 import torch
 
-from .all_transformers import transformers_by_class_name
-
-
 class WaveformPipeline(torch.nn.Module):
     def __init__(self, transformers):
         super().__init__()
@@ -15,6 +12,7 @@ class WaveformPipeline(torch.nn.Module):
     def from_class_names_and_kwargs(
         cls, geom, channel_index, class_names_and_kwargs
     ):
+        from .all_transformers import transformers_by_class_name
         return cls(
             [
                 transformers_by_class_name[name](
@@ -66,7 +64,7 @@ class WaveformPipeline(torch.nn.Module):
 
         return waveforms, features
 
-    def fit(self, waveforms, max_channels):
+    def fit(self, waveforms, max_channels, recording):
         assert waveforms.ndim == 3
         assert max_channels.shape[0] == waveforms.shape[0]
 
@@ -74,8 +72,9 @@ class WaveformPipeline(torch.nn.Module):
             return
 
         for transformer in self.transformers:
-            transformer.train()
-            transformer.fit(waveforms, max_channels=max_channels)
+            if transformer.needs_fit():
+                transformer.train()
+                transformer.fit(waveforms, max_channels=max_channels, recording=recording)
             transformer.eval()
 
             # if we're done already, stop before denoising
@@ -162,7 +161,11 @@ def featurization_config_to_class_names_and_kwargs(fconf):
         class_names_and_kwargs.append(
             (
                 fconf.nn_denoiser_class_name,
-                {"pretrained_path": fconf.nn_denoiser_pretrained_path},
+                {
+                    "pretrained_path": fconf.nn_denoiser_pretrained_path,
+                    "n_epochs": fconf.nn_denoiser_train_epochs,
+                    **(fconf.nn_denoiser_extra_kwargs or {}),
+                },
             )
         )
     if fconf.do_tpca_denoise:

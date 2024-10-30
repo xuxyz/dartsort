@@ -3,10 +3,11 @@ import torch
 import torch.nn.functional as F
 from dartsort.util import nn_util, spikeio
 from dartsort.util.spiketorch import get_relative_index, reindex
-from dartsort.util.waveform_util import regularize_channel_index, grab_main_channels
-from torch.utils.data import Dataset, DataLoader, StackDataset, TensorDataset, BatchSampler, RandomSampler, WeightedRandomSampler
-from dartsort.util.waveform_util import regularize_channel_index
-from torch.utils.data import DataLoader, TensorDataset
+from dartsort.util.waveform_util import (grab_main_channels,
+                                         regularize_channel_index)
+from torch.utils.data import (BatchSampler, DataLoader, Dataset, RandomSampler,
+                              StackDataset, TensorDataset,
+                              WeightedRandomSampler)
 from tqdm.auto import trange
 
 from .transform_base import BaseWaveformDenoiser
@@ -19,28 +20,29 @@ class Decollider(BaseWaveformDenoiser):
         self,
         channel_index,
         geom,
-        recording,
         hidden_dims=(256, 256),
         use_batchnorm=True,
         name=None,
         name_prefix="",
         exz_estimator="n3n",
-        inference_kind="raw",
+        inference_kind="amortized",
         batch_size=32,
         learning_rate=1e-3,
-        epochs=25,
+        n_epochs=50,
         channelwise_dropout_p=0.2,
         inference_z_samples=10,
-        n_data_workers=0,
+        n_data_workers=4,
         with_conv_fullheight=False,
         sample_weighting=None,
         detach_amortizer=True,
         eyz_net_residual=True,
         e_exz_y_net_residual=True,
+        pretrained_path=None,
     ):
         assert exz_estimator in ("n2n", "2n2", "n3n", "3n3")
         assert inference_kind in ("raw", "exz", "exz_fromz", "amortized", "exy_fake")
         assert sample_weighting in (None, "kmeans")
+        assert pretrained_path is None
         super().__init__(
             geom=geom, channel_index=channel_index, name=name, name_prefix=name_prefix
         )
@@ -50,10 +52,9 @@ class Decollider(BaseWaveformDenoiser):
         self.inference_kind = inference_kind
         self.hidden_dims = hidden_dims
         self.n_channels = len(geom)
-        self.recording = recording
         self.batch_size = batch_size
         self.learning_rate = learning_rate
-        self.epochs = epochs
+        self.n_epochs = n_epochs
         self.channelwise_dropout_p = channelwise_dropout_p
         self.n_data_workers = n_data_workers
         self.with_conv_fullheight = with_conv_fullheight
@@ -112,10 +113,10 @@ class Decollider(BaseWaveformDenoiser):
             self.inf_net = self.get_mlp(residual=self.e_exz_y_net_residual)
         self.to(self.relative_index.device)
 
-    def fit(self, waveforms, max_channels):
+    def fit(self, waveforms, max_channels, recording):
         waveforms = reindex(max_channels, waveforms, self.relative_index, pad_value=0.0)
         with torch.enable_grad():
-            self._fit(waveforms, max_channels)
+            self._fit(waveforms, max_channels, recording)
         self._needs_fit = False
 
     def forward(self, waveforms, max_channels):
@@ -234,13 +235,13 @@ class Decollider(BaseWaveformDenoiser):
             loss_dict["e_exz_y"] = F.mse_loss(mask * to_amortize, mask * e_exz_y)
         return loss_dict
 
-    def _fit(self, waveforms, channels):
+    def _fit(self, waveforms, channels, recording):
         self.initialize_nets(waveforms.shape[1])
         waveforms = waveforms.cpu()
         channels = channels.cpu()
         main_dataset = TensorDataset(waveforms, channels)
         noise_dataset = SameChannelNoiseDataset(
-            self.recording,
+            recording,
             channels.numpy(force=True),
             self.model_channel_index_np,
             spike_length_samples=self.spike_length_samples,
@@ -267,7 +268,7 @@ class Decollider(BaseWaveformDenoiser):
         )
         optimizer = torch.optim.Adam(self.parameters(), lr=self.learning_rate)
 
-        with trange(self.epochs, desc="Epochs", unit="epoch") as pbar:
+        with trange(self.n_epochs, desc="Epochs", unit="epoch") as pbar:
             for epoch in pbar:
                 epoch_losses = {}
                 for (waveform_batch, channels_batch), noise_batch in dataloader:

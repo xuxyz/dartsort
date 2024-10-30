@@ -1,8 +1,8 @@
 import matplotlib.pyplot as plt
 import numpy as np
-from matplotlib.patches import Rectangle
 from matplotlib.collections import LineCollection
 from matplotlib.colors import to_rgba
+from matplotlib.patches import Rectangle
 
 
 def geomplot(
@@ -29,6 +29,7 @@ def geomplot(
     c=None,
     color=None,
     colors=None,
+    return_chans=False,
     **plot_kwargs,
 ):
     """Plot waveforms according to geometry using channel index"""
@@ -54,19 +55,20 @@ def geomplot(
             raise ValueError(f"Bad shapes: {waveforms.shape=}, {max_channels.shape=}, {C=}")
         channels = channel_index[max_channels]
     else:
-        n_channels = geom.shape[0]
+        n_channels = geom[np.isfinite(geom).all(1)].shape[0]
         T = waveforms.shape[1]
         assert channels.shape[0] == waveforms.shape[0]
         assert channels.shape[1] == waveforms.shape[-1]
 
     # -- figure out units for plotting
-    z_uniq, z_ix = np.unique(geom[:, 1], return_inverse=True)
+    valid = np.isfinite(geom).all(1)
+    z_uniq, z_ix = np.unique(geom[valid, 1], return_inverse=True)
     for i in z_ix:
-        x_uniq = np.unique(geom[z_ix == i, 0])
+        x_uniq = np.unique(geom[valid][z_ix == i, 0])
         if x_uniq.size > 1:
             break
     else:
-        x_uniq = np.unique(geom[:, 0])
+        x_uniq = np.unique(geom[valid, 0])
     inter_chan_x = 1
     if x_uniq.size > 1:
         inter_chan_x = x_uniq[1] - x_uniq[0]
@@ -76,7 +78,7 @@ def geomplot(
         T / inter_chan_x / x_extension,
         max_abs_amp / inter_chan_z / z_extension,
     ]
-    geom_plot = geom * geom_scales
+    geom_plot = geom[valid] * geom_scales
     t_domain = np.linspace(-T // 2, T // 2, num=T)
 
     # -- and, plot
@@ -115,18 +117,22 @@ def geomplot(
         if show_chan_label:
             ax.annotate(chan_labels[c], geom_plot[c] + ann_offset, size=6, color="gray")
     lines = LineCollection(
-        draw,
-        colors=draw_colors if draw_colors else None,
+        np.array(draw),
+        colors=np.array(draw_colors) if draw_colors else None,
         **plot_kwargs,
     )
     lines = ax.add_collection(lines)
     if annotate_z:
-        for c in unique_chans:
-            ax.annotate(
-                f"{geom[c, 1]:f}".rstrip("0").rstrip("."),
-                (xmin, geom_plot[c, 1]),
+        unique_z = np.unique(geom[list(unique_chans)])
+        unique_zp = np.unique(geom_plot[list(unique_chans)])
+        for z, zp in zip(unique_z, unique_zp):
+            ax.text(
+                xmin,
+                zp,
+                f"{z:f}".rstrip("0").rstrip("."),
                 size=6,
                 color="gray",
+                clip_on=True,
             )
 
     if subar:
@@ -219,5 +225,10 @@ def geomplot(
         max_z = max(geom_plot[c, 1] for c in unique_chans)
         if np.isfinite([min_z, max_z]).all():
             ax.set_ylim([min_z - max_abs_amp * zlim, max_z + max_abs_amp * zlim])
+    elif zlim is False:
+        pass
+
+    if return_chans:
+        return lines, unique_chans
 
     return lines

@@ -1,13 +1,38 @@
+import dataclasses
+
 import hdbscan
+import h5py
 import numpy as np
 import spikeinterface
-from dartsort.util import drift_util, spikeio
+from dartsort.util import drift_util, spikeio, data_util, waveform_util
 from dredge.motion_util import IdentityMotionEstimate
+from scipy.cluster.hierarchy import fcluster, linkage
 from scipy.spatial import KDTree
 from sklearn.neighbors import KNeighborsClassifier
-from spikeinterface.comparison import compare_two_sorters
-from tqdm.auto import tqdm
-import dataclasses
+
+
+def agglomerate(labels, distances, linkage_method="complete", threshold=1.0):
+    """"""
+    n = distances.shape[0]
+    pdist = distances[np.triu_indices(n, k=1)]
+    if pdist.min() > threshold:
+        ids = np.unique(labels)
+        return labels, ids[ids >= 0]
+    finite = np.isfinite(pdist)
+    if not finite.all():
+        inf = max(0, pdist[finite].max()) + threshold + 1.0
+        pdist[np.logical_not(finite)] = inf
+
+    Z = linkage(pdist, method=linkage_method)
+    new_ids = fcluster(Z, threshold, criterion="distance")
+    # offset by 1, I think always, but I don't want to be wrong?
+    new_ids -= new_ids.min()
+
+    kept = labels >= 0
+    new_labels = np.full_like(labels, -1)
+    new_labels[kept] = new_ids[labels[kept]]
+
+    return new_labels, new_ids
 
 
 def reorder_by_depth(sorting, motion_est=None):
@@ -292,7 +317,7 @@ def remove_self_duplicates(
 
             # reshape to NxT
             template = np.median(wfs_unit, axis=0)
-            mc = template.ptp(0).argmax()
+            mc = np.ptp(template, 0).argmax()
             template_mc = template[:, mc]
             template_argmin = np.abs(template_mc).argmax()
 
@@ -342,6 +367,7 @@ def remove_duplicate_spikes(
     full_duplicate_fraction=0.95,
     min_result_spikes=10,
 ):
+    from spikeinterface.comparison import compare_two_sorters
     # normalize agreement by smaller unit and then remove only the spikes with agreement
     sorting = make_sorting_from_labels_frames(clusterer.labels_, spike_frames)
     # remove duplicates
@@ -448,3 +474,19 @@ def meet(labels_a, labels_b):
     labels_ab = np.stack((labels_a, labels_b), axis=1)
     ab_unique, meet_labels = np.unique(labels_ab, axis=0, return_inverse=True)
     return meet_labels
+
+
+def get_main_channel_pcs(sorting, which=slice(None), rank=1, show_progress=False, dataset_name="collisioncleaned_tpca_features"):
+    mask = np.zeros(len(sorting), dtype=bool)
+    mask[which] = True
+    channels = sorting.channels[which]
+
+    features = np.empty((mask.sum(), rank), dtype=np.float32)
+    with h5py.File(sorting.parent_h5_path, "r", locking=False) as h5:
+        feats_dset = h5[dataset_name]
+        channel_index = h5["channel_index"][:]
+        for ixs, feats in data_util.yield_masked_chunks(mask, feats_dset, show_progress=show_progress, desc_prefix="Main channel"):
+            feats = feats[:, :rank]
+            feats = waveform_util.grab_main_channels(feats, channels[ixs], channel_index)
+            features[ixs] = feats
+    return features

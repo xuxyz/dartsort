@@ -79,9 +79,9 @@ class GTUnitTextInfo(UnitComparisonPlot):
 
         gt_temp = comparison.gt_analysis.coarse_template_data.unit_templates(unit_id)
         tested_temp = comparison.tested_analysis.coarse_template_data.unit_templates(tested_unit_id)
-        gt_ptp = gt_temp.ptp(1).max(1).squeeze()
+        gt_ptp = np.ptp(gt_temp, 1).max(1).squeeze()
         assert gt_ptp.size == 1
-        tested_ptp = tested_temp.ptp(1).max(1).squeeze()
+        tested_ptp = np.ptp(tested_temp, 1).max(1).squeeze()
         assert tested_ptp.size == 1
         msg += f"GT PTP: {gt_ptp:0.1f}; matched PTP: {tested_ptp:0.1f}\n"
         msg += f"{tested_nspikes} spikes in matched unit\n"
@@ -432,8 +432,10 @@ class MetricRegPlot(ComparisonPlot):
 
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", category=RuntimeWarning)
+            df_show = df[np.isfinite(df[self.y].values)]
+            df_show = df_show[np.isfinite(df_show[self.x].values)]
             sns.regplot(
-                data=df,
+                data=df_show,
                 x=self.x,
                 y=self.y,
                 logistic=True,
@@ -521,8 +523,7 @@ class TrimmedTemplateDistanceMatrix(ComparisonPlot):
     def draw(self, panel, comparison):
         agreement = comparison.comparison.get_ordered_agreement_scores()
         row_order = agreement.index
-        col_order = np.array(agreement.columns)[:agreement.shape[0]]
-        dist = comparison.template_distances[row_order, :][:, col_order]
+        dist = comparison.template_distances[row_order, :]
 
         ax = panel.subplots()
         log1p_norm = FuncNorm((np.log1p, np.expm1), vmin=0)
@@ -549,6 +550,19 @@ gt_overview_plots = (
     MetricDistribution(),
     TrimmedAgreementMatrix(),
     TrimmedTemplateDistanceMatrix(),
+)
+
+gt_overview_plots_no_temp_dist = (
+    MetricRegPlot(x="gt_ptp_amplitude", y="accuracy", log_x=True),
+    MetricRegPlot(x="gt_ptp_amplitude", y="recall", color="r", log_x=True),
+    MetricRegPlot(x="gt_ptp_amplitude", y="precision", color="g", log_x=True),
+    MetricRegPlot(x="gt_firing_rate", y="accuracy"),
+    MetricRegPlot(x="gt_firing_rate", y="recall", color="r"),
+    MetricRegPlot(x="gt_firing_rate", y="precision", color="g"),
+    MetricRegPlot(x="gt_ptp_amplitude", y="unsorted_recall", color="purple", log_x=True),
+    box,
+    MetricDistribution(xs=("recall", "accuracy", "temp_dist", "precision")),
+    TrimmedAgreementMatrix(),
 )
 
 # multi comparisons stuff

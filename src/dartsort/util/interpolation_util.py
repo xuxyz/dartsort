@@ -103,12 +103,14 @@ def interpolate_by_chunk(
         if source_shifts.ndim == 1:
             # allows per-channel shifts
             source_shifts = source_shifts.unsqueeze(1)
+        source_shifts = source_shifts.unsqueeze(-1)
         source_pos = source_geom[source_channels] + source_shifts
 
         # where are they going?
         target_pos = target_geom[target_channels[ixs]]
 
         # interpolate, store
+        chunk_features = torch.from_numpy(chunk_features).to(device)
         chunk_res = kernel_interpolate(
             chunk_features,
             source_pos,
@@ -172,9 +174,10 @@ def kernel_interpolate(
 
     # -- build kernel
     if interpolation_method == "nearest":
-        d = torch.cdist(source_pos, target_pos)
+        d = torch.cdist(source_pos, target_pos).nan_to_num(nan=torch.inf)
+        n, ns, nt = d.shape
         kernel = torch.zeros_like(d)
-        kernel[d.argmin(dim=(1, 2), keepdim=True)] = 1
+        kernel.scatter_(1, d.argmin(dim=1, keepdim=True), 1)
     else:
         kernel = log_rbf(source_pos, target_pos, sigma)
         if interpolation_method == "normalized":
@@ -182,7 +185,12 @@ def kernel_interpolate(
             kernel.nan_to_num_()
         elif interpolation_method.startswith("kriging"):
             kernel = kernel.exp_()
-            kernel = source_kernel_invs @ kernel
+            if source_kernel_invs is None:
+                sk = log_rbf(source_pos, sigma=sigma).exp_()
+                kernel = torch.linalg.lstsq(sk.cpu(), kernel.cpu(), driver="gelsd")
+                kernel = kernel.solution.to(features)
+            else:
+                kernel = source_kernel_invs @ kernel
             if interpolation_method == "kriging_normalized":
                 kernel = kernel / kernel.sum(1, keepdim=True)
         elif interpolation_method == "rbf":
