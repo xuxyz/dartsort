@@ -24,7 +24,8 @@ class StableSpikeDataset(torch.nn.Module):
         core_features: torch.Tensor,
         extract_features: torch.Tensor,
         core_neighborhoods: "SpikeNeighborhoods",
-        features_on_device: bool = True,
+        extract_neighborhoods: "SpikeNeighborhoods",
+        features_on_device: bool = False,
         interpolation_method: str = "kriging",
         interpolation_sigma: float = 20.0,
         core_radius: float = 35.0,
@@ -52,6 +53,7 @@ class StableSpikeDataset(torch.nn.Module):
 
         # neighborhoods module, for querying spikes by channel group
         self.core_neighborhoods = core_neighborhoods
+        self.extract_neighborhoods = extract_neighborhoods
 
         extract_amp_vecs = torch.linalg.vector_norm(extract_features, dim=1)
         amps = extract_amp_vecs.nan_to_num().max(1).values
@@ -95,13 +97,13 @@ class StableSpikeDataset(torch.nn.Module):
         core_radius=35.0,
         subsampling_rg=0,
         max_n_spikes=np.inf,
-        features_on_device=True,
+        discard_triaged=False,
         interpolation_sigma=20.0,
         interpolation_method="kriging",
         motion_depth_mode="channel",
         features_dataset_name="collisioncleaned_tpca_features",
         show_progress=False,
-        store_on_device=True,
+        store_on_device=False,
         workers=-1,
         device=None,
     ):
@@ -110,18 +112,22 @@ class StableSpikeDataset(torch.nn.Module):
         device = torch.device(device)
 
         # which spikes to keep?
-        if len(sorting) > max_n_spikes:
-            rg = np.random.default_rng(subsampling_rg)
-            kept_indices = rg.choice(len(sorting), size=max_n_spikes, replace=False)
-            kept_indices.sort()
-            keep = np.zeros(len(sorting), dtype=bool)
-            keep[kept_indices] = 1
-            keep_select = kept_indices
+        if discard_triaged:
+            keep = sorting.labels >= 0
+            keep_select = kept_indices = np.flatnonzero(keep)
         else:
             keep = np.ones(len(sorting), dtype=bool)
             kept_indices = np.arange(len(sorting))
             keep_select = slice(None)
+        if kept_indices.size > max_n_spikes:
+            rg = np.random.default_rng(subsampling_rg)
+            kept_kept = rg.choice(kept_indices.size, size=max_n_spikes, replace=False)
+            kept_kept.sort()
+            keep[kept_indices] = 0
+            keep[kept_indices[kept_kept]] = 1
+            keep_select = kept_indices = kept_indices[kept_kept]
 
+        # load information not stored directly on the sorting
         with h5py.File(sorting.parent_h5_path, "r", locking=False) as h5:
             geom = h5["geom"][:]
             extract_channel_index = h5["channel_index"][:]
@@ -149,8 +155,11 @@ class StableSpikeDataset(torch.nn.Module):
                 workers=workers,
                 motion_depth_mode=motion_depth_mode,
             )
-            extract_channels = torch.from_numpy(extract_channels).to(device)
-            core_channels = torch.from_numpy(core_channels).to(device)
+            extract_channels = torch.from_numpy(extract_channels)
+            core_channels = torch.from_numpy(core_channels)
+            if store_on_device:
+                extract_channels = extract_channels.to(device)
+                core_channels = core_channels.to(device)
 
             # stabilize features with interpolation
             extract_features = interpolation_util.interpolate_by_chunk(
@@ -187,8 +196,13 @@ class StableSpikeDataset(torch.nn.Module):
         # load temporal PCA
         tpca = get_tpca(sorting)
 
-        # determine core channel neighborhoods
-        core_neighborhoods = SpikeNeighborhoods.from_channels(core_channels, len(prgeom) - 1)
+        # determine channel neighborhoods
+        core_neighborhoods = SpikeNeighborhoods.from_channels(
+            core_channels, len(prgeom) - 1
+        )
+        extract_neighborhoods = SpikeNeighborhoods.from_channels(
+            extract_channels, len(prgeom) - 1
+        )
 
         self = cls(
             kept_indices=kept_indices,
@@ -199,8 +213,9 @@ class StableSpikeDataset(torch.nn.Module):
             original_sorting=sorting,
             core_features=core_features,
             extract_features=extract_features,
+            extract_neighborhoods=extract_neighborhoods,
             core_neighborhoods=core_neighborhoods,
-            features_on_device=features_on_device,
+            features_on_device=store_on_device,
             interpolation_method=interpolation_method,
             interpolation_sigma=interpolation_sigma,
             core_radius=core_radius,
@@ -216,21 +231,26 @@ class StableSpikeDataset(torch.nn.Module):
         with_reconstructions: bool = False,
         with_neighborhood_ids: bool = False,
     ) -> "SpikeFeatures":
-        channels = None
+        channels = neighborhood_ids = None
         if neighborhood == "extract":
             features = self.extract_features[indices]
             if with_channels:
                 channels = self.extract_channels[indices]
+            if with_neighborhood_ids:
+                neighborhood_ids = self.extract_neighborhoods.neighborhood_ids[indices]
         elif neighborhood == "core":
             features = self.core_features[indices]
             if with_channels:
                 channels = self.core_channels[indices]
+            if with_neighborhood_ids:
+                neighborhood_ids = self.core_neighborhoods.neighborhood_ids[indices]
         else:
             assert False
 
         if not self.features_on_device:
             features = features.to(self.device)
-            channels = channels.to(self.device)
+            if with_channels:
+                channels = channels.to(self.device)
 
         waveforms = None
         if with_reconstructions:
@@ -241,7 +261,11 @@ class StableSpikeDataset(torch.nn.Module):
             waveforms = waveforms.reshape(n, c, -1).permute(0, 2, 1)
 
         return SpikeFeatures(
-            indices=indices, features=features, channels=channels, waveforms=waveforms
+            indices=indices,
+            features=features,
+            channels=channels,
+            waveforms=waveforms,
+            neighborhood_ids=neighborhood_ids,
         )
 
     def interp_to_chans(self, spike_data, channels):
@@ -272,37 +296,52 @@ class SpikeFeatures:
     channels: Optional[torch.LongTensor] = None
     # n, t, c
     waveforms: Optional[torch.Tensor] = None
+    # n
+    neighborhood_ids: Optional[torch.LongTensor] = None
 
     def __len__(self):
         return len(self.features)
 
     def __getitem__(self, ix):
         """Subset the spikes in this collection with [subset]."""
-        waveforms = channels = None
+        waveforms = channels = neighborhood_ids = None
         if self.channels is not None:
             channels = self.channels[ix]
         if self.waveforms is not None:
             waveforms = self.waveforms[ix]
+        if self.neighborhood_ids is not None:
+            neighborhood_ids = self.neighborhood_ids[ix]
         return self.__class__(
             indices=self.indices[ix],
             features=self.features[ix],
             channels=channels,
             waveforms=waveforms,
+            neighborhood_ids=neighborhood_ids,
         )
 
     def __repr__(self):
-        indstr = f"inds.shape={self.indices.shape},"
-        featstr = f"feats.shape={self.features.shape},"
+        indstr = f"indices.shape={self.indices.shape},"
+        featstr = f"features.shape={self.features.shape},"
         chanstr = wfstr = ""
         if self.channels is not None:
-            chanstr = f"feats.shape={self.channels.shape},"
+            chanstr = f"channels.shape={self.channels.shape},"
         if self.waveforms is not None:
-            wfstr = f"feats.shape={self.waveforms.shape},"
-        return f"{self.__class__.__name__}({indstr}{featstr}{chanstr}{wfstr})"
+            wfstr = f"waveforms.shape={self.waveforms.shape},"
+        if self.neighborhood_ids is not None:
+            idstr = f"neighborhood_ids.shape={self.neighborhood_ids.shape},"
+        pstr = f"{indstr}{featstr}{chanstr}{wfstr}{idstr}"
+        return f"{self.__class__.__name__}({pstr.rstrip(',')})"
 
 
 class SpikeNeighborhoods(torch.nn.Module):
-    def __init__(self, n_channels, neighborhood_ids, neighborhoods, neighborhood_members=None):
+    def __init__(
+        self,
+        n_channels,
+        neighborhood_ids,
+        neighborhoods,
+        neighborhood_members=None,
+        store_on_device: bool = False,
+    ):
         """SpikeNeighborhoods
 
         Sparsely keep track of which channels each spike lives on. Used to query
@@ -319,8 +358,12 @@ class SpikeNeighborhoods(torch.nn.Module):
         """
         super().__init__()
         self.n_channels = n_channels
-        self.register_buffer("neighborhood_ids", neighborhood_ids)
-        self.register_buffer("neighborhoods", neighborhoods)
+        if store_on_device:
+            self.register_buffer("neighborhood_ids", neighborhood_ids)
+            self.register_buffer("neighborhoods", neighborhoods)
+        else:
+            self.neighborhood_ids = neighborhood_ids
+            self.neighborhoods = neighborhoods
         self.n_neighborhoods = len(neighborhoods)
 
         # store neighborhoods as a matrix
@@ -361,8 +404,14 @@ class SpikeNeighborhoods(torch.nn.Module):
 
     @classmethod
     def from_channels(cls, channels, n_channels):
-        neighborhoods, neighborhood_ids = torch.unique(channels, dim=0, return_inverse=True)
-        return cls(n_channels=n_channels, neighborhoods=neighborhoods, neighborhood_ids=neighborhood_ids)
+        neighborhoods, neighborhood_ids = torch.unique(
+            channels, dim=0, return_inverse=True
+        )
+        return cls(
+            n_channels=n_channels,
+            neighborhoods=neighborhoods,
+            neighborhood_ids=neighborhood_ids,
+        )
 
     def neighborhood_members(self, id):
         return self._neighborhood_members[self.neighborhood_members_slices[id]]
@@ -389,10 +438,7 @@ class SpikeNeighborhoods(torch.nn.Module):
             for j in covered_ids
         }
         n_spikes = self.popcounts[covered_ids].sum()
-        if add_to_overlaps is not None:
-            for _, members in neighborhood_info.values():
-                add_to_overlaps[members] += 1
-        return neighborhood_info, n_spikes
+        return covered_ids, neighborhood_info, n_spikes
 
     def spike_neighborhoods(self, channels, spike_indices, min_coverage=1.0):
         """Like subset_neighborhoods, but for an already chosen collection of spikes
@@ -402,7 +448,7 @@ class SpikeNeighborhoods(torch.nn.Module):
         spike_indices[neighborhood_member_indices] are the actual indices.
         """
         spike_ids = self.neighborhood_ids[spike_indices]
-        neighborhoods_considered = torch.unique(spike_ids)
+        neighborhoods_considered = torch.unique(spike_ids).to(self.indicators.device)
         inds = self.indicators[channels][:, neighborhoods_considered]
         coverage = inds.sum(0) / self.channel_counts[neighborhoods_considered]
         covered_ids = neighborhoods_considered[coverage >= min_coverage].cpu()
@@ -416,6 +462,16 @@ class SpikeNeighborhoods(torch.nn.Module):
 
 
 # -- helpers
+
+
+def occupied_chans(spike_data, n_channels, neighborhoods=None):
+    if spike_data.neighborhood_ids is None:
+        chans = torch.unique(spike_data.channels)
+        return chans[chans < n_channels]
+    ids = torch.unique(spike_data.neighborhood_ids)
+    chans = neighborhoods.neighborhoods[ids]
+    chans = torch.unique(chans)
+    return chans[chans < n_channels].to(spike_data.channels)
 
 
 def interp_to_chans(
@@ -437,6 +493,65 @@ def interp_to_chans(
         allow_destroy=False,
         interpolation_method=interpolation_method,
     )
+
+
+def pad_to_chans(
+    spike_data, channels, n_channels, weights=None, target_padded=None, pad_value=0.0
+):
+    n, r, c = spike_data.features.shape
+    c_targ = channels.numel()
+
+    # determine channels to write to
+    reindexer = get_channel_reindexer(channels, n_channels)
+    target_ixs = reindexer[spike_data.channels]
+
+    # scatter data
+    if target_padded is None:
+        if pad_value == 0.0:
+            target_padded = spike_data.features.new_zeros(n, r, c_targ + 1)
+        else:
+            target_padded = spike_data.features.new_full((n, r, c_targ + 1), pad_value)
+    scatter_ixs = target_ixs.unsqueeze(1).broadcast_to((n, r, c))
+    target_padded.scatter_(src=spike_data.features, dim=2, index=scatter_ixs)
+    target = target_padded[..., :-1]
+    if weights is None:
+        return target, None
+
+    # same for weights, if supplied
+    assert weights.shape == (n,)
+    weights_padded = weights.new_zeros((n, c_targ + 1))
+    weights = weights.unsqueeze(1).broadcast_to((n, c))
+    weights_padded.scatter_(src=weights, dim=1, index=target_ixs)
+    weights = weights_padded[:, :-1]
+    return target, weights
+
+
+def zero_pad_to_chans(
+    spike_data, channels, n_channels, weights=None, target_padded=None
+):
+    return pad_to_chans(spike_data, channels, n_channels, weights=weights)
+
+
+def get_channel_reindexer(channels, n_channels):
+    """
+    Arguments
+    ---------
+    channels : LongTensor
+        Shape (n_chans_subset,)
+    n_channels : int
+
+    Returns
+    -------
+    reindexer : LongTensor
+        Shape (n_channels + 1,)
+        reindexer[i] is the index of i in channels, if present.
+        Otherwise, it is n_chans_subset.
+        And the last entry is, of course, n_chans_subset.
+    """
+    reindexer = channels.new_full((n_channels + 1,), channels.numel())
+    (rel_ixs,) = torch.nonzero(channels < n_channels, as_tuple=True)
+    reindexer[channels[rel_ixs]] = rel_ixs
+    return reindexer
 
 
 def get_shift_info(sorting, motion_est, geom, keep_select, motion_depth_mode):

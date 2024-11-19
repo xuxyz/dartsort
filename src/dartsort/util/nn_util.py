@@ -234,5 +234,6 @@ if hasattr(torch.serialization, "add_safe_globals"):
             nn.Conv1d,
             nn.ReLU,
             nn.BatchNorm1d,
+            nn.LayerNorm,
         ]
     )

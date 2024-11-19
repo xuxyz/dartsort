@@ -108,6 +108,9 @@ def smoothed_dipscore_at(
     null="isotoniconesideunnormed",
     debug_info=None,
 ):
+    if samples.size < 3:
+        return 0.0
+
     if sample_weights is None:
         sample_weights = np.ones_like(samples)
     densities = density.get_smoothed_densities(
@@ -121,7 +124,8 @@ def smoothed_dipscore_at(
     )
     spacings = np.diff(samples)
     spacings = np.concatenate((spacings[:1], 0.5 * (spacings[1:] + spacings[:-1]), spacings[-1:]))
-    densities /= (densities * spacings).sum()
+    with np.errstate(all="raise"):
+        densities /= (densities * spacings).sum()
 
     if cut is None:
         # closest maxes left + right of 0

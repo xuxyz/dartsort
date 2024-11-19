@@ -303,12 +303,7 @@ class EmbeddedNoise(torch.nn.Module):
       - "factorized_rank_diag" : factorized, but rank factor is diagonal
       - "factorized_by_rank_rank_diag" : factorized_by_rank, but rank factor is diagonal
          this one is block diagonal and therefore nicer than factorized_by_rank.
-
-    Default here for now is factorized_by_rank_rank_diag. This is because empirically,
-    rank covs were observed to be diagonal-ish (not extremely close, but not super
-    far). And, spatial covs look to be of spatially-decaying kernel type, but the band
-    width depends on the rank (since ranks ~ frequency bands). So let's model those
-    differences by default -- it doesn't cost much.
+      - "full": not generally practical.
     """
 
     def __init__(
@@ -324,6 +319,7 @@ class EmbeddedNoise(torch.nn.Module):
         rank_vt=None,
         channel_std=None,
         channel_vt=None,
+        full_cov=None,
     ):
         super().__init__()
         self.rank = rank
@@ -346,6 +342,9 @@ class EmbeddedNoise(torch.nn.Module):
             self.register_buffer("rank_vt", rank_vt)
         if channel_vt is not None:
             self.register_buffer("channel_vt", channel_vt)
+
+        if full_cov is not None:
+            self.register_buffer("full_cov", full_cov)
 
         # precompute stuff
         self._full_cov = None
@@ -383,6 +382,15 @@ class EmbeddedNoise(torch.nn.Module):
         if self.mean_kind == "full":
             return self.mean
         assert False
+
+    def whiten(self, data, channels=slice(None)):
+        assert self.mean_kind == "zero"
+        cov = self.marginal_covariance(channels=channels)
+        assert data.ndim == 3
+        data = data.reshape(len(data), -1)
+        res = linear_operator.sqrt_inv_matmul(cov, data.unsqueeze(2))
+        assert res.ndim == 3 and res.shape == (*data.shape, 1)
+        return res
 
     def marginal_covariance(self, channels=slice(None), cache_key=None, device=None):
         if device is not None:
@@ -425,12 +433,21 @@ class EmbeddedNoise(torch.nn.Module):
             chans_std = self.full_std[:, channels]
             return operators.DiagLinearOperator(chans_std**2)
 
+        if self.cov_kind == "full":
+            marg_cov = self.full_cov[:, channels][..., channels]
+            r, c = marg_cov.shape[:2]
+            marg_cov = marg_cov.reshape(r * c, r * c)
+            return linear_operator.to_linear_operator(marg_cov)
+
         if self.cov_kind == "factorized":
             rank_root = self.rank_vt.T * self.rank_std
-            rank_root = operators.RootLinearOperator(rank_root)
-            chan_root = self.channel_vt.T * self.channel_std
-            chan_root = operators.RootLinearOperator(chan_root)
-            return torch.kron(rank_root, chan_root)
+            rank_cov = rank_root @ rank_root.T
+            # rank_root = operators.RootLinearOperator(rank_root)
+            chan_root = self.channel_vt.T[channels] * self.channel_std
+            chan_cov = chan_root @ chan_root.T
+            # chan_root = operators.RootLinearOperator(chan_root)
+            # return torch.kron(rank_root, chan_root)
+            return operators.KroneckerProductLinearOperator(rank_cov, chan_cov)
 
         if self.cov_kind == "factorized_rank_diag":
             rank_cov = operators.DiagLinearOperator(self.rank_std.square())
@@ -441,11 +458,10 @@ class EmbeddedNoise(torch.nn.Module):
 
         if self.cov_kind == "factorized_by_rank_rank_diag":
             chans_vt = self.channel_vt[:, :, channels]
-            r, C, c = chans_vt.shape
-            blocks = chans_vt.new_empty((r, c, c))
-            chans_std = self.channel_std[:, :]  # no slice here!
-            for q, sq in enumerate(self.rank_std):
-                blocks[q] = sq * chans_vt[q].T @ chans_vt[q]
+            chans_std = self.channel_std[:, :, None]  # no slice here!
+            rank_std = self.rank_std.view(self.rank, 1, 1)
+            chan_root = (rank_std * chans_std) * chans_vt
+            blocks = torch.bmm(chan_root.mT, chan_root)
             blocks = linear_operator.to_linear_operator(blocks)
             return operators.BlockDiagLinearOperator(blocks)
 
@@ -487,6 +503,7 @@ class EmbeddedNoise(torch.nn.Module):
             assert False
 
         # estimate covs
+        # still n, rank, n_channels
         dxsq = x.square()
         full_var = torch.nanmean(dxsq, dim=0)
         rank_var = torch.nanmean(full_var, dim=1)
@@ -509,6 +526,15 @@ class EmbeddedNoise(torch.nn.Module):
             )
             full_std = full_var.sqrt()
             return cls(mean=mean, global_std=global_std, full_std=full_std, **init_kw)
+
+        if cov_kind == "full":
+            x = x.view(n, rank * n_channels)
+            present = torch.isfinite(x).any(dim=0)
+            cov = torch.eye(x.shape[1], device=x.device, dtype=x.dtype)
+            vcov = spiketorch.nancov(x[:, present])
+            cov[present[:, None] & present[None, :]] = vcov.view(-1)
+            cov = cov.reshape(rank, n_channels, rank, n_channels)
+            return cls(mean=mean, global_std=global_std, full_cov=cov, **init_kw)
 
         assert cov_kind.startswith("factorized")
         # handle rank part first, then the spatial part
@@ -556,7 +582,12 @@ class EmbeddedNoise(torch.nn.Module):
                 channel_vt[q] = qv.T
         else:
             x_spatial = x_spatial.reshape(n * rank, n_channels)
-            cov_spatial = spiketorch.nancov(x_spatial)
+            valid = x_spatial.isfinite().any(0)
+            cov = spiketorch.nancov(x_spatial[:, valid])
+            cov_spatial = torch.eye(
+                x_spatial.shape[1], dtype=cov.dtype, device=cov.device
+            )
+            cov_spatial[valid[:, None] & valid[None, :]] = cov.view(-1)
             channel_eig, channel_v = torch.linalg.eigh(cov_spatial)
             channel_std = channel_eig.sqrt()
             channel_vt = channel_v.T.contiguous()
@@ -571,6 +602,34 @@ class EmbeddedNoise(torch.nn.Module):
             **init_kw,
         )
 
+    @classmethod
+    def estimate_from_hdf5(
+        cls,
+        hdf5_path,
+        mean_kind="zero",
+        cov_kind="factorized_by_rank_rank_diag",
+        motion_est=None,
+        interpolation_method="kriging",
+        sigma=20.0,
+        device=None,
+    ):
+        from dartsort.util.drift_util import registered_geometry
+        with h5py.File(hdf5_path, "r", locking=False) as h5:
+            geom = h5["geom"][:]
+        rgeom = geom
+        if motion_est is not None:
+            rgeom = registered_geometry(geom, motion_est=motion_est)
+        snippets = interpolate_residual_snippets(
+            motion_est,
+            hdf5_path,
+            geom,
+            rgeom,
+            sigma=sigma,
+            interpolation_method=interpolation_method,
+            device=device
+        )
+        return cls.estimate(snippets, mean_kind=mean_kind, cov_kind=cov_kind)
+
 
 def interpolate_residual_snippets(
     motion_est,
@@ -578,8 +637,6 @@ def interpolate_residual_snippets(
     geom,
     registered_geom,
     sigma=10.0,
-    mean_kind="zero",
-    cov_kind="scalar",
     residual_times_s_dataset_name="residual_times_seconds",
     residual_dataset_name="residual",
     channels_mode="round",
