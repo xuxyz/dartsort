@@ -3,17 +3,66 @@ import torch.nn.functional as F
 from torch import nn
 
 
-def get_mlp(input_dim, hidden_dims, output_dim, norm_kind="batchnorm"):
+# def get_mlp(input_dim, hidden_dims, output_dim, norm_kind="batchnorm"):
+#     input_dims = [input_dim, *hidden_dims[:-1]]
+#     layers = []
+
+#     for ind, outd in zip(input_dims, hidden_dims):
+#         layers.append(nn.Linear(ind, outd))
+#         if norm_kind == "batchnorm":
+#             layers.append(nn.BatchNorm1d(outd))
+#         elif norm_kind == "layernorm":
+#             layers.append(nn.LayerNorm(outd))
+#         layers.append(nn.ReLU())
+
+#     final_dim = hidden_dims[-1] if hidden_dims else input_dim
+#     layers.append(nn.Linear(final_dim, output_dim))
+
+#     return nn.Sequential(*layers)
+
+
+class ResidualBlock(nn.Module):
+    def __init__(self, input_dim, output_dim, norm_kind="batchnorm"):
+        super().__init__()
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.norm_kind = norm_kind
+
+        self.linear = nn.Linear(input_dim, output_dim)
+        self.norm = None
+        if norm_kind == "batchnorm":
+            self.norm = nn.BatchNorm1d(output_dim)
+        elif norm_kind == "layernorm":
+            self.norm = nn.LayerNorm(output_dim)
+        self.relu = nn.ReLU()
+
+        self.projection = nn.Linear(input_dim, output_dim) if input_dim != output_dim else None
+
+    def forward(self, x):
+        residual = x
+        out = self.linear(x)
+        if self.norm:
+            out = self.norm(out)
+        out = self.relu(out)
+        if self.projection:
+            residual = self.projection(residual)
+        return out + residual
+
+
+def get_mlp(input_dim, hidden_dims, output_dim, norm_kind="batchnorm", residual=True):
     input_dims = [input_dim, *hidden_dims[:-1]]
     layers = []
 
     for ind, outd in zip(input_dims, hidden_dims):
-        layers.append(nn.Linear(ind, outd))
-        if norm_kind == "batchnorm":
-            layers.append(nn.BatchNorm1d(outd))
-        elif norm_kind == "layernorm":
-            layers.append(nn.LayerNorm(outd))
-        layers.append(nn.ReLU())
+        if residual:
+            layers.append(ResidualBlock(ind, outd, norm_kind))
+        else:
+            layers.append(nn.Linear(ind, outd))
+            if norm_kind == "batchnorm":
+                layers.append(nn.BatchNorm1d(outd))
+            elif norm_kind == "layernorm":
+                layers.append(nn.LayerNorm(outd))
+            layers.append(nn.ReLU())
 
     final_dim = hidden_dims[-1] if hidden_dims else input_dim
     layers.append(nn.Linear(final_dim, output_dim))
@@ -21,6 +70,7 @@ def get_mlp(input_dim, hidden_dims, output_dim, norm_kind="batchnorm"):
     return nn.Sequential(*layers)
 
 
+# V1 
 def get_waveform_mlp(
     spike_length_samples,
     n_input_channels,
@@ -66,9 +116,12 @@ def get_waveform_mlp(
     if channelwise_dropout_p:
         layers.append(ChannelwiseDropout(channelwise_dropout_p))
     layers.append(nn.Flatten())
-    layers.append(
-        get_mlp(input_dim, hidden_dims, output_dim, norm_kind=norm_kind)
-    )
+    # layers.append(
+    #     get_mlp(input_dim, hidden_dims, output_dim, norm_kind=norm_kind)
+    # )
+    layers.append(get_mlp(input_dim, hidden_dims, output_dim, norm_kind=norm_kind, residual=True))
+
+    
     if return_initial_shape:
         layers.append(nn.Unflatten(-1, (spike_length_samples, n_input_channels)))
     if final_conv_fullheight:
@@ -94,6 +147,9 @@ def get_waveform_mlp(
     return net
 
 
+
+
+
 class ResidualForm(nn.Module):
 
     def __init__(self, module):
@@ -105,6 +161,7 @@ class ResidualForm(nn.Module):
         return input + output
 
 
+
 class WaveformOnlyResidualForm(nn.Module):
     def __init__(self, module):
         super().__init__()
@@ -114,6 +171,9 @@ class WaveformOnlyResidualForm(nn.Module):
         waveforms, masks = inputs
         output = self.module(inputs)
         return waveforms + output
+
+
+
 
 
 class ChannelwiseDropout(nn.Module):
