@@ -84,6 +84,7 @@ def get_waveform_mlp(
     final_conv_fullheight=False,
     return_initial_shape=False,
     residual=False,
+    residual_blocks=False,
 ):
     input_dim = n_input_channels * (spike_length_samples + input_includes_mask)
 
@@ -119,7 +120,7 @@ def get_waveform_mlp(
     # layers.append(
     #     get_mlp(input_dim, hidden_dims, output_dim, norm_kind=norm_kind)
     # )
-    layers.append(get_mlp(input_dim, hidden_dims, output_dim, norm_kind=norm_kind, residual=True))
+    layers.append(get_mlp(input_dim, hidden_dims, output_dim, norm_kind=norm_kind, residual=residual_blocks))
 
     
     if return_initial_shape:
