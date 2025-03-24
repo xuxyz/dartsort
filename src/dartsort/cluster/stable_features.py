@@ -128,6 +128,7 @@ class StableSpikeDataset(torch.nn.Module):
         self.tpca = tpca
 
         # neighborhoods module, for querying spikes by channel group
+        self.not_train_indices = torch.tensor([], dtype=int)
         if self.has_splits and "train" in self.split_indices:
             train_ixs = self.split_indices["train"]
             self.n_spikes_train = len(train_ixs)
@@ -143,6 +144,9 @@ class StableSpikeDataset(torch.nn.Module):
                 name="extract",
             )
             self._train_extract_channels = extract_channels.cpu()[train_ixs]
+            self.not_train_indices = torch.from_numpy(
+                np.setdiff1d(np.arange(self.n_spikes), train_ixs)
+            )
         core_channel_index = waveform_util.make_channel_index(
             prgeom, core_radius, to_torch=True
         )
@@ -166,7 +170,7 @@ class StableSpikeDataset(torch.nn.Module):
 
         # channel neighborhoods and features
         # if not self.features_on_device, .spike_data() will .to(self.device)
-        times_s = torch.asarray(self.original_sorting.times_seconds[kept_indices])
+        times_s = torch.asarray(self.original_sorting.times_seconds)
         self.core_features = core_features
         if self.features_on_device:
             self.register_buffer("_train_extract_features", train_extract_features)
@@ -200,7 +204,7 @@ class StableSpikeDataset(torch.nn.Module):
         features_dataset_name="collisioncleaned_tpca_features",
         split_names=("train", "val"),
         split_proportions=(0.75, 0.25),
-        show_progress=False,
+        show_progress=True,
         store_on_device=False,
         workers=-1,
         device=None,
@@ -246,6 +250,7 @@ class StableSpikeDataset(torch.nn.Module):
         with h5py.File(sorting.parent_h5_path, "r", locking=False) as h5:
             geom = h5["geom"][:]
             extract_channel_index = h5["channel_index"][:]
+            assert np.all(np.diff(extract_channel_index) >= 0)
             if motion_est is None:
                 registered_geom = geom
             else:
@@ -745,20 +750,27 @@ class SpikeNeighborhoods(torch.nn.Module):
         In this case, the returned neighborhood_member_indices keys are relative:
         spike_indices[neighborhood_member_indices] are the actual indices.
         """
-        spike_ids = neighborhood_ids
-        if spike_ids is None:
-            spike_ids = self.neighborhood_ids[spike_indices]
-        assert spike_ids is not None
-        covered_ids = torch.unique(spike_ids)
+        if neighborhood_ids is None:
+            assert spike_indices is not None
+            neighborhood_ids = self.neighborhood_ids[spike_indices]
+        assert neighborhood_ids is not None
+
+        covered_ids = torch.unique(neighborhood_ids)
         if min_coverage:
             covered_ids = covered_ids.to(self.indicators.device)
             inds = self.indicators[channels][:, covered_ids]
             coverage = inds.sum(0) / self.channel_counts[covered_ids]
             covered = coverage >= min_coverage
             covered_ids = covered_ids[covered].cpu()
-            spike_ids = spike_ids.cpu()
+            neighborhood_ids = neighborhood_ids.cpu()
+
         neighborhood_info = [
-            (j, self.neighborhoods[j], *(spike_ids == j).nonzero(as_tuple=True), None)
+            (
+                j,
+                self.neighborhoods[j],
+                *(neighborhood_ids == j).nonzero(as_tuple=True),
+                None,
+            )
             for j in covered_ids
         ]
         n_spikes = self.popcounts[covered_ids].sum()
@@ -834,7 +846,7 @@ def interp_to_chans(
             sigma=interpolation_sigma,
             allow_destroy=False,
             interpolation_method=interpolation_method,
-            out=output[sl]
+            out=output[sl],
         )
     return output
 

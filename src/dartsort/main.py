@@ -1,5 +1,6 @@
 from dataclasses import asdict
 from pathlib import Path
+from logging import getLogger
 
 import numpy as np
 
@@ -19,7 +20,11 @@ from dartsort.config import (
     default_matching_config,
     default_computation_config,
 )
-from dartsort.peel import ObjectiveUpdateTemplateMatchingPeeler, SubtractionPeeler, GrabAndFeaturize
+from dartsort.peel import (
+    ObjectiveUpdateTemplateMatchingPeeler,
+    SubtractionPeeler,
+    GrabAndFeaturize,
+)
 from dartsort.templates import TemplateData
 from dartsort.util.data_util import (
     DARTsortSorting,
@@ -30,19 +35,21 @@ from dartsort.util.peel_util import run_peeler
 from dartsort.util.registration_util import estimate_motion
 
 
+logger = getLogger(__name__)
+
+
 def dartsort(
     recording,
-    output_directory,
+    output_dir,
     cfg: (
         DARTsortUserConfig | DeveloperConfig | DARTsortInternalConfig
     ) = default_dartsort_config,
     motion_est=None,
     overwrite=False,
-    return_extra=False,
 ):
     """TODO: fast forward."""
-    output_directory = Path(output_directory)
-    output_directory.mkdir(exist_ok=True)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(exist_ok=True)
     cfg = to_internal_config(cfg)
 
     ret = {}
@@ -50,15 +57,14 @@ def dartsort(
     # first step: initial detection and motion estimation
     sorting = subtract(
         recording,
-        output_directory,
+        output_dir,
         waveform_config=cfg.waveform_config,
         featurization_config=cfg.featurization_config,
         subtraction_config=cfg.subtraction_config,
         computation_config=cfg.computation_config,
         overwrite=overwrite,
     )
-    if return_extra:
-        ret["initial_detection"] = sorting
+    logger.info(f"Initial detection: {sorting}")
 
     if cfg.subtract_only:
         ret["sorting"] = sorting
@@ -68,7 +74,7 @@ def dartsort(
         motion_est = estimate_motion(
             recording,
             sorting,
-            output_directory,
+            output_dir,
             overwrite=overwrite,
             device=cfg.computation_config.actual_device(),
             **asdict(cfg.motion_estimation_config),
@@ -79,7 +85,7 @@ def dartsort(
         ret["sorting"] = sorting
         return ret
 
-    # clustering
+    # clustering: initialization
     sorting = initial_clustering(
         recording,
         sorting=sorting,
@@ -87,60 +93,68 @@ def dartsort(
         clustering_config=cfg.clustering_config,
         computation_config=cfg.computation_config,
     )
-    if return_extra:
-        ret["initial_labels"] = sorting.labels.copy()
-    sorting = refine_clustering(
+    logger.info(f"Initial clustering: {sorting}")
+    ds_tasks("initial", sorting, output_dir, cfg)
+
+    # clustering: model
+    sorting, info = refine_clustering(
         recording=recording,
         sorting=sorting,
         motion_est=motion_est,
         refinement_config=cfg.refinement_config,
         computation_config=cfg.computation_config,
+        return_step_labels=cfg.save_intermediate_labels,
     )
-    if return_extra:
-        ret["refined0_labels"] = sorting.labels.copy()
+    logger.info(f"Initial refinement: {sorting}")
+    for k, v in info.items():
+        ds_tasks(f"refined0{k}", sorting, output_dir, cfg, step_labels=v)
+    ds_tasks("refined0", sorting, output_dir, cfg)
 
-    # alternate matching with
     for step in range(1, cfg.matching_iterations + 1):
         is_final = step == cfg.matching_iterations
+        # TODO
         prop = 1.0 if is_final else cfg.intermediate_matching_subsampling
 
         sorting = match(
             recording,
             sorting,
-            output_directory,
+            output_dir,
             motion_est=motion_est,
             template_config=cfg.template_config,
             waveform_config=cfg.waveform_config,
             featurization_config=cfg.featurization_config,
             matching_config=cfg.matching_config,
-            overwrite=overwrite,
+            overwrite=overwrite or cfg.overwrite_matching,
             computation_config=cfg.computation_config,
             hdf5_filename=f"matching{step}.h5",
             model_subdir=f"matching{step}_models",
         )
-        if return_extra:
-            ret[f"matching{step}"] = sorting
+        logger.info(f"Matching step {step}: {sorting}")
+        ds_tasks(f"matching{step}", sorting, output_dir, cfg)
 
-        if (not is_final) or cfg.final_refinement:
-            sorting = refine_clustering(
+        if cfg.final_refinement or not is_final:
+            sorting, info = refine_clustering(
                 recording=recording,
                 sorting=sorting,
                 motion_est=motion_est,
                 refinement_config=cfg.refinement_config,
                 computation_config=cfg.computation_config,
+                return_step_labels=cfg.save_intermediate_labels,
             )
-            if return_extra:
-                ret[f"refined{step}_labels"] = sorting.labels
+            logger.info(f"Refinement step {step}: {sorting}")
+            refn = f"refined{step}"
+            for k, v in info.items():
+                ds_tasks(f"{refn}{k}", sorting, output_dir, cfg, step_labels=v)
+            ds_tasks(refn, sorting, output_dir, cfg)
 
-    # done~
-    sorting.save(output_directory / "dartsort_sorting.npz")
+    sorting.save(output_dir / "dartsort_sorting.npz")
     ret["sorting"] = sorting
     return ret
 
 
 def subtract(
     recording,
-    output_directory,
+    output_dir,
     waveform_config=default_waveform_config,
     featurization_config=default_featurization_config,
     subtraction_config=default_subtraction_config,
@@ -161,7 +175,7 @@ def subtract(
     )
     detections = run_peeler(
         subtraction_peeler,
-        output_directory,
+        output_dir,
         hdf5_filename,
         model_subdir=model_subdir,
         featurization_config=featurization_config,
@@ -177,7 +191,7 @@ def subtract(
 def match(
     recording,
     sorting=None,
-    output_directory=None,
+    output_dir=None,
     motion_est=None,
     waveform_config=default_waveform_config,
     template_config=default_template_config,
@@ -193,8 +207,8 @@ def match(
     template_npz_filename="template_data.npz",
     computation_config=default_computation_config,
 ):
-    assert output_directory is not None
-    model_dir = Path(output_directory) / model_subdir
+    assert output_dir is not None
+    model_dir = Path(output_dir) / model_subdir
 
     # compute templates
     if template_data is None:
@@ -208,6 +222,7 @@ def match(
             overwrite=overwrite,
             save_npz_name=template_npz_filename,
             computation_config=computation_config,
+            with_locs=motion_est is not None,
         )
 
     # instantiate peeler
@@ -221,7 +236,7 @@ def match(
     )
     sorting = run_peeler(
         matching_peeler,
-        output_directory,
+        output_dir,
         hdf5_filename,
         model_subdir,
         featurization_config,
@@ -237,7 +252,7 @@ def match(
 def grab(
     recording,
     sorting,
-    output_directory,
+    output_dir,
     waveform_config=default_waveform_config,
     featurization_config=default_featurization_config,
     chunk_starts_samples=None,
@@ -256,7 +271,7 @@ def grab(
     )
     sorting = run_peeler(
         grabber,
-        output_directory,
+        output_dir,
         hdf5_filename,
         model_subdir,
         featurization_config,
@@ -271,7 +286,7 @@ def grab(
 def match_chunked(
     recording,
     sorting,
-    output_directory=None,
+    output_dir=None,
     motion_est=None,
     waveform_config=default_waveform_config,
     template_config=default_template_config,
@@ -322,7 +337,7 @@ def match_chunked(
         chunk_sorting, chunk_h5 = match(
             recording,
             sorting=sorting_chunk,
-            output_directory=output_directory,
+            output_dir=output_dir,
             motion_est=motion_est,
             waveform_config=default_waveform_config,
             template_config=default_template_config,
@@ -346,9 +361,12 @@ def match_chunked(
     return sortings, hdf5_filenames
 
 
-def run_dev_tasks(results, output_directory, cfg):
-    output_directory = Path(output_directory).resolve(strict=True)
+def ds_tasks(step_name, step_sorting, output_dir, cfg, step_labels=None):
+    output_dir = Path(output_dir).resolve(strict=True)
+
     if cfg.save_intermediate_labels:
-        for k, v in results.items():
-            if k.endswith("_labels"):
-                np.save(output_directory / f"{k}.npy", v, allow_pickle=False)
+        step_labels_npy = output_dir / f"{step_name}_labels.npy"
+        logger.info(f"Saving {step_name} labels to {step_labels_npy}")
+        if step_labels is None:
+            step_labels = step_sorting.labels
+        np.save(step_labels_npy, step_labels, allow_pickle=False)

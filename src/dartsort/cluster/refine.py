@@ -1,3 +1,6 @@
+import gc
+from logging import getLogger
+
 from .. import config
 from ..util import job_util, noise_util
 from .split import split_clusters
@@ -6,28 +9,35 @@ from .stable_features import StableSpikeDataset
 from .gaussian_mixture import SpikeMixtureModel
 
 
+logger = getLogger(__name__)
+
+
 def refine_clustering(
     recording,
     sorting,
     motion_est=None,
     refinement_config=config.default_refinement_config,
     computation_config=None,
+    return_step_labels=False,
 ):
     """Refine a clustering using the strategy specified by the config."""
     if refinement_config.refinement_stragegy == "splitmerge":
         assert refinement_config.split_merge_config is not None
-        return split_merge(
+        ref = split_merge(
             recording,
             sorting,
             motion_est=motion_est,
             split_merge_config=refinement_config.split_merge_config,
             computation_config=computation_config,
         )
+        return ref, {}
 
     # below is all gmm stuff
     assert refinement_config.refinement_stragegy == "gmm"
     if computation_config is None:
         computation_config = job_util.get_global_computation_config()
+
+    logger.dartsortdebug(f"Refine clustering from {sorting.parent_h5_path}")
 
     noise = noise_util.EmbeddedNoise.estimate_from_hdf5(
         sorting.parent_h5_path,
@@ -68,35 +78,65 @@ def refine_clustering(
         em_converged_atol=refinement_config.em_converged_atol,
         channels_strategy=refinement_config.channels_strategy,
         hard_noise=refinement_config.hard_noise,
+        split_decision_algorithm=refinement_config.split_decision_algorithm,
+        merge_decision_algorithm=refinement_config.merge_decision_algorithm,
     )
     gmm.cleanup()
+    # these are for benchmarking
+    step_labels = {}
+    intermediate_split = "full" if return_step_labels else "kept"
+    gmm.log_liks = None  # TODO
     for it in range(refinement_config.n_total_iters):
         if refinement_config.truncated:
-            log_liks = gmm.tem()
+            res = gmm.tvi(final_split=intermediate_split)
+            gmm.log_liks = res["log_liks"]
         else:
-            log_liks = gmm.em()
+            gmm.log_liks = gmm.em(final_split=intermediate_split)
+        if return_step_labels:
+            step_labels[f"refstepaem{it}"] = gmm.labels.numpy(force=True).copy()
 
-        assert log_liks is not None
+        assert gmm.log_liks is not None
+        # TODO: if split is self-consistent enough, we don't need this.
         if (
-            log_liks.shape[0]
+            gmm.log_liks.shape[0]
             > refinement_config.max_avg_units * recording.get_num_channels()
         ):
-            print(f"{log_liks.shape=}, skipping split.")
+            logger.dartsortdebug(f"{gmm.log_liks.shape=}, skipping split.")
         else:
+            # TODO: not this.
             gmm.split()
+            gmm.log_liks = None
+
+            gc.collect()
             if refinement_config.truncated:
-                log_liks = gmm.tem()
+                res = gmm.tvi(final_split=intermediate_split)
+                gmm.log_liks = res["log_liks"]
             else:
-                log_liks = gmm.em()
-        gmm.merge(log_liks)
+                gmm.log_liks = gmm.em(final_split=intermediate_split)
+            if return_step_labels:
+                step_labels[f"refstepbsplit{it}"] = gmm.labels.numpy(force=True).copy()
+        assert gmm.log_liks is not None
+        gmm.merge(gmm.log_liks)
+        gmm.log_liks = None
+
+        gc.collect()
+        if return_step_labels:
+            step_labels[f"refstepcmerge{it}"] = gmm.labels.numpy(force=True).copy()
 
     if refinement_config.truncated:
-        log_liks = gmm.tem(final_split="full")
+        res = gmm.tvi(final_split="full")
+        gmm.log_liks = res  # not actually! but just to del it later.
     else:
-        log_liks = gmm.em(final_split="full")
+        gmm.log_liks = gmm.em(final_split="full")
+    gmm.log_liks = None
+
+    gc.collect()
     gmm.cpu()
     sorting = gmm.to_sorting()
-    return sorting
+    del gmm
+
+    gc.collect()
+    return sorting, step_labels
 
 
 def split_merge(

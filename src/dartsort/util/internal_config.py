@@ -221,7 +221,7 @@ class MatchingConfig:
     fit_sampling: str = "random"
 
     # template matching parameters
-    threshold: float = 150.0
+    threshold: float | Literal["fp_control"] = 15.0  # norm, not normsq
     template_svd_compression_rank: int = 10
     template_temporal_upsampling_factor: int = 8
     template_min_channel_amplitude: float = 1.0
@@ -324,29 +324,33 @@ class RefinementConfig:
     interpolation_sigma: float = 20.0
     val_proportion: float = 0.25
     max_n_spikes: float | int = argfield(default=4_000_000, arg_type=int_or_inf)
-    max_avg_units: int = 8
+    max_avg_units: int = 3
 
     # model params
     channels_strategy: str = "count"
     min_count: int = 50
     signal_rank: int = 0
     n_spikes_fit: int = 4096
-    ppca_inner_em_iter: int = 10
-    distance_metric: Literal["noise_metric", "kl", "reverse_kl", "symkl"] = "symkl"
+    ppca_inner_em_iter: int = 5
+    distance_metric: Literal["noise_metric", "kl", "reverse_kl", "symkl"] = (
+        "noise_metric"
+    )
     distance_normalization_kind: Literal["none", "noise", "channels"] = "noise"
-    merge_distance_threshold: float = 1.5
+    merge_distance_threshold: float = 2.0
     # if None, switches to bimodality
     merge_criterion_threshold: float | None = 0.0
     merge_criterion: Literal[
         "heldout_loglik",
-        "heldout_ccl",
-        "loglik",
-        "ccl",
-        "aic",
-        "bic",
-        "icl",
+        "heldout_elbo",
+        "old_heldout_loglik",
+        "old_heldout_ccl",
+        "old_loglik",
+        "old_ccl",
+        "old_aic",
+        "old_bic",
+        "old_icl",
         "bimodality",
-    ] = "heldout_ccl"
+    ] = "heldout_elbo"
     merge_bimodality_threshold: float = 0.05
     n_em_iters: int = 25
     em_converged_prop: float = 0.02
@@ -354,7 +358,9 @@ class RefinementConfig:
     em_converged_atol: float = 1e-2
     n_total_iters: int = 3
     hard_noise: bool = False
-    truncated: bool = False
+    truncated: bool = True
+    split_decision_algorithm: str = "tree"
+    merge_decision_algorithm: str = "brute"
 
     # if someone wants this
     split_merge_config: SplitMergeConfig | None = None
@@ -411,6 +417,10 @@ class DARTsortInternalConfig:
     final_refinement: bool = True
     matching_iterations: int = 1
     intermediate_matching_subsampling: float = 1.0
+    overwrite_matching: bool = False
+
+    # development / debugging flags
+    save_intermediate_labels: bool = False
 
 
 default_waveform_config = WaveformConfig()
@@ -499,10 +509,13 @@ def to_internal_config(cfg):
         merge_criterion_threshold=cfg.merge_criterion_threshold,
         merge_bimodality_threshold=cfg.merge_bimodality_threshold,
         n_total_iters=cfg.n_refinement_iters,
+        n_em_iters=cfg.n_em_iters,
         max_n_spikes=cfg.gmm_max_spikes,
         val_proportion=cfg.gmm_val_proportion,
         channels_strategy=cfg.channels_strategy,
-        truncated=cfg.use_tem,
+        truncated=cfg.truncated,
+        split_decision_algorithm=cfg.gmm_split_decision_algorithm,
+        merge_decision_algorithm=cfg.gmm_merge_decision_algorithm,
     )
     motion_estimation_config = MotionEstimationConfig(
         **{k.name: getattr(cfg, k.name) for k in fields(MotionEstimationConfig)}
@@ -533,4 +546,6 @@ def to_internal_config(cfg):
         computation_config=computation_config,
         dredge_only=cfg.dredge_only,
         matching_iterations=cfg.matching_iterations,
+        overwrite_matching=cfg.overwrite_matching,
+        save_intermediate_labels=cfg.save_intermediate_labels,
     )

@@ -1,6 +1,8 @@
 import numpy as np
 import torch
 from matplotlib.lines import Line2D
+from matplotlib.patches import Ellipse
+from matplotlib.transforms import Affine2D
 
 from .colors import glasbey1024
 from .waveforms import geomplot
@@ -54,7 +56,17 @@ def amp_double_scatter(gmm, indices, panel, unit_id=None, labels=None, viol_ms=N
             ax_dist.hist(amps[labels == j], color=glasbey1024[j], label="unit", **histk)
 
 
-def plot_means(panel, prgeom, tpca, chans, units, labels, title="nearest neighbors"):
+def plot_means(
+    panel,
+    prgeom,
+    tpca,
+    chans,
+    units,
+    labels,
+    title="nearest neighbors",
+    do_legend=True,
+    linewidths=None,
+):
     ax = panel.subplots()
 
     means = []
@@ -62,7 +74,7 @@ def plot_means(panel, prgeom, tpca, chans, units, labels, title="nearest neighbo
         mean = unit.mean[:, chans]
         means.append(tpca.force_reconstruct(mean).numpy(force=True))
 
-    colors = glasbey1024[labels]
+    colors = [glasbey1024[l] if l >= 0 else "k" for l in labels]
     geomplot(
         np.stack(means, axis=0),
         channels=chans[None].broadcast_to(len(means), *chans.shape).numpy(force=True),
@@ -72,20 +84,53 @@ def plot_means(panel, prgeom, tpca, chans, units, labels, title="nearest neighbo
         ax=ax,
         zlim=None,
         subar=True,
+        linewidths=linewidths,
     )
-    panel.legend(
-        handles=[Line2D([0, 1], [0, 0], color=c) for c in colors],
-        labels=labels.tolist(),
-        loc="outside upper center",
-        frameon=False,
-        ncols=4,
-        title=title,
-        fontsize="small",
-        borderpad=0,
-        labelspacing=0.25,
-        handlelength=1.0,
-        handletextpad=0.4,
-        borderaxespad=0.0,
-        columnspacing=1.0,
-    )
+    if do_legend:
+        panel.legend(
+            handles=[Line2D([0, 1], [0, 0], color=c) for c in colors],
+            labels=list(labels),
+            loc="outside upper center",
+            frameon=False,
+            ncols=4,
+            title=title,
+            fontsize="small",
+            borderpad=0,
+            labelspacing=0.25,
+            handlelength=1.0,
+            handletextpad=0.4,
+            borderaxespad=0.0,
+            columnspacing=1.0,
+        )
     ax.axis("off")
+
+
+def unit_pca_ellipse(ax, channels, unit, v, center, noise, color, lw=1, whiten=True):
+    # get the whitened pca basis on those channels
+    wv = v[:, :2]
+    if whiten:
+        whitener = noise.whitener(channels=channels)
+        wv = whitener.T @ wv
+
+    # center and project mean and cov into whitened pca basis
+    mean = (unit.mean[:, channels] - center).view(-1) @ wv
+    mean = mean.view(-1).numpy(force=True)
+    assert mean.shape == (2,)
+    cov = unit.marginal_covariance(channels=channels).to_dense()
+    cov = wv.T @ cov @ wv
+    rho = cov[0, 1] / np.sqrt(np.diagonal(cov).prod())
+
+    # draw ellipses
+    ax.scatter(*mean, marker="s", fc=color, ec="k", lw=1, s=5)
+    ell = Ellipse(
+        (0, 0),
+        width=np.sqrt(1 + rho) * 2,
+        height=np.sqrt(1 - rho) * 2,
+        facecolor="none",
+        edgecolor=color,
+        lw=lw,
+    )
+    sx, sy = 2 * np.sqrt(np.diagonal(cov))
+    tfx = Affine2D().rotate_deg(45).scale(sx, sy).translate(*mean)
+    ell.set_transform(tfx + ax.transData)
+    ax.add_patch(ell)

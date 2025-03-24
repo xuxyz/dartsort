@@ -96,28 +96,29 @@ def test_fakedata():
             motion_estimation_config=dartsort.MotionEstimationConfig(
                 do_motion_estimation=False
             ),
-            matching_iterations=0,
+            threshold="fp_control",
+            matching_iterations=1,
+            # test the dev tasks pipeline
+            save_intermediate_labels=True,
         )
-        res = dartsort.dartsort(rec, output_directory=tempdir, cfg=cfg)
+        res = dartsort.dartsort(rec, output_dir=tempdir, cfg=cfg)
 
-    with tempfile.TemporaryDirectory() as tempdir:
-        cfg = dartsort.DARTsortInternalConfig(
-            subtraction_config=dartsort.SubtractionConfig(
-                subtraction_denoising_config=dartsort.FeaturizationConfig(
-                    denoise_only=True, do_nn_denoise=False
-                )
-            ),
-            refinement_config=dartsort.RefinementConfig(min_count=10),
-            featurization_config=dartsort.FeaturizationConfig(n_residual_snips=512),
-            motion_estimation_config=dartsort.MotionEstimationConfig(
-                do_motion_estimation=False
-            ),
-        )
-        cfg0 = dartsort.DeveloperConfig(save_intermediate_labels=True)
-        res = dartsort.dartsort(
-            rec, output_directory=tempdir, cfg=cfg, return_extra=cfg0.needs_extra
-        )
-        dartsort.run_dev_tasks(res, tempdir, cfg0)
+    for do_motion_estimation in (False, True):
+        with tempfile.TemporaryDirectory() as tempdir:
+            cfg = dartsort.DARTsortInternalConfig(
+                subtraction_config=dartsort.SubtractionConfig(
+                    subtraction_denoising_config=dartsort.FeaturizationConfig(
+                        denoise_only=True, do_nn_denoise=False
+                    )
+                ),
+                refinement_config=dartsort.RefinementConfig(min_count=10),
+                featurization_config=dartsort.FeaturizationConfig(n_residual_snips=512),
+                motion_estimation_config=dartsort.MotionEstimationConfig(
+                    do_motion_estimation=do_motion_estimation,
+                    rigid=True,
+                ),
+            )
+            res = dartsort.dartsort(rec, output_dir=tempdir, cfg=cfg)
 
 
 def test_cli_help():
